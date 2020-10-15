@@ -1,0 +1,343 @@
+---
+title: "PG"
+output: html_document
+---
+
+```{r}
+# Can we predict a player's signing bonus? #
+
+library(rstanarm)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+
+#Import data
+College_Pitching <- read.csv("college_pitching_past.csv")
+College_Pitching_Recent <- read.csv("~/Desktop/steinle_college_pitching_recent.csv")
+College_Pitching <- rbind(College_Pitching, College_Pitching_Recent)
+College_Pitching <- College_Pitching %>% filter(year >= 2014)
+View(College_Pitching)
+College_Batting <- read.csv("College_Batting2.csv")
+College_Batting <- College_Batting %>% filter(year >= 2014)
+View(College_Batting)
+Bonus <- read.csv("signing_bonuses.csv")
+Bonus <- Bonus %>% filter(year >= 2014)
+View(Bonus)
+
+#Clean up college pitching data, batting is done
+College_Pitching$HT <- as.character(College_Pitching$HT)
+College_Pitching <- separate(College_Pitching, "HT", into = c("HF", "HI"), sep = "-")
+College_Pitching$HF <- as.numeric(College_Pitching$HF)
+College_Pitching$HI <- as.numeric(College_Pitching$HI)
+College_Pitching <- College_Pitching %>% mutate(Height = 12*HF + HI)
+#Add some necessary columns
+College_Pitching <- College_Pitching %>% mutate("PA" = 3*IP + H + BB + IBB)
+College_Pitching <- College_Pitching %>% mutate("GS%" = GS / G, "K%" = SO / PA, "K/IP" = SO / IP, "BB%" = BB / PA, "BB/IP" = BB / IP, "HR%" = HR/PA, "HR/IP" = HR/IP, "FIP" = ((13*HR + 3*(BB)-2*SO)/IP) + 3.2)
+#Using Chris Long's conference adjustments try to assign a rank to each conference
+College_Pitching <- College_Pitching %>% mutate(leagueName_Rating = case_when(leagueName == "NJCAA" ~ 0.30, leagueName == "Big West Conference" ~ 1.275, leagueName == "Sun Belt Conference" ~ 1.107, leagueName == "Atlantic Coast Conference" ~ 1.550, leagueName == "MAC" ~ 0.843, leagueName == "Southeastern Conference" ~ 1.639, leagueName == "Big Ten Conference" ~ 1.148, leagueName == "Conference USA" ~ 1.264, leagueName == "Mid-American Conference" ~ 0.843, leagueName == "Ohio Valley Conference" ~ 0.907, leagueName == "Big 12 Conference" ~ 1.575, leagueName == "Mountain West Conference" ~ 1.098, leagueName == "Colonial Athletic Association" ~ 0.910, leagueName == "Big East Conference" ~ 0.958, leagueName == "Big South Conference" ~ 0.895, leagueName == "West Coast Conference" ~ 1.177, leagueName == "CCCAA" ~ 0.50, leagueName == "NCAA II" ~ 0.50, leagueName == "Summit League" ~ 0.685, leagueName == "Pacific-10 Conference" ~ 1.531, leagueName == "Pacific-12 Conference" ~ 1.531, leagueName == "NAIA" ~ 0.25, leagueName == "Southland Conference" ~ 1.065, leagueName == "Missouri Valley Conference" ~ 1.055, leagueName == "Horizon League" ~ 0.975, leagueName == "America East Conference" ~ 0.917, leagueName == "Metro Atlantic Athletic Conference" ~ 0.736, leagueName == "NCAA III" ~ 0.10, leagueName == "Atlantic Sun Conference" ~ 0.951, leagueName == "Southern Conference" ~ 0.993, leagueName == "Patriot League" ~ 0.689, leagueName == "Northeast Conference" ~ 0.661, leagueName == "Atlantic 10 Conference" ~ 0.828, leagueName == "Western Athletic Conference" ~ 0.844, leagueName == "Southwest Athletic Conference" ~ 0.474, leagueName == "Independent" ~ 0.327, leagueName == "Mid-Eastern Athletic Conference" ~ 0.623, leagueName == "Ivy League" ~ 0.937, leagueName == "Mid-Continent Conference" ~ 1, leagueName == "Great West Conference" ~ 1, leagueName == "American Athletic Conference" ~ 1.353,leagueName == 'Great Plains Athletic Conference' ~ 1
+))
+#For now conference adjust data by multiplying by conference adjustment
+College_Pitching <- College_Pitching %>% mutate("CAK%" = College_Pitching$`K%` * leagueName_Rating, "CABB%" = College_Pitching$`BB%` * leagueName_Rating, "CAHR%" = College_Pitching$`HR%` * leagueName_Rating, "CAFIP" = FIP * leagueName_Rating)
+#Innings pitched requirement
+IP_Level <- College_Pitching %>% filter(IP >= 15)
+#Compute where people are above or below their conference
+College_Pitching <- IP_Level %>% group_by(year, leagueName) %>% mutate(MeanK = mean(IP_Level$`K%`), MeanBB = mean(IP_Level$`BB%`), MeanHR = mean(IP_Level$`K%`), MeanFIP = mean(FIP), CAMeanK = mean(IP_Level$`CAK%`), CAMeanBB = mean(IP_Level$`CABB%`), CAMeanHR = mean(IP_Level$`CAK%`), CAMeanFIP = mean(CAFIP), SDK = sd(IP_Level$`K%`), SDBB = sd(IP_Level$`BB%`), SDHR = sd(IP_Level$`K%`), SDFIP = sd(FIP), CASDK = sd(IP_Level$`CAK%`), CASDBB = sd(IP_Level$`CABB%`), CASDHR = sd(IP_Level$`CAK%`), CASDFIP = sd(CAFIP), MeanAge = mean(Age), SDAge = sd(Age))
+#Z Score relative to conference adjusted stats
+College_Pitching <- College_Pitching %>% mutate(Z_K = (`K%` - MeanK)/SDK, Z_BB = (`BB%` - MeanBB)/SDBB, Z_HR = (`HR%` - MeanHR)/SDHR, Z_FIP = (FIP - MeanFIP)/SDFIP, Z_Age = (Age - MeanAge)/SDAge, CAZ_K = (`CAK%` - CAMeanK)/CASDK, CAZ_BB = (`CABB%` - CAMeanBB)/CASDBB, CAZ_HR = (`CAHR%` - CAMeanHR)/CASDHR, CAZ_FIP = (CAFIP - CAMeanFIP)/CASDFIP)
+View(College_Pitching)
+
+#Link to where I got conference ratings from: https://github.com/octonion/baseball-public/blob/master/ncaa/sql/conferences.txt
+
+
+#Combine results with bonus data#
+names(College_Batting)[3] <- "Team"
+names(College_Batting)[1] <- "PlayerID"
+names(Bonus)[4] <- "draft_overall"
+College_Batting_Combined <- merge(College_Batting, Bonus, by = c("PlayerID", "year", "draft_overall"))
+View(College_Batting_Combined)
+
+names(College_Pitching)[3] <- "Team"
+names(College_Pitching)[1] <- "PlayerID"
+College_Pitching_Combined <- merge(College_Pitching, Bonus, by = c("PlayerID", "year", "draft_overall"))
+View(College_Pitching_Combined)
+
+
+College_Batting_Combined <- College_Batting_Combined %>% mutate(Class = case_when(
+  playerClass == "5S" ~ "5S",
+  playerClass == "HS" ~ "HS",
+  playerClass == "J4" ~ "J4",
+  playerClass == "jr" ~ "JR",
+  playerClass == "Jr" ~ "JR",
+  playerClass == "JR" ~ "JR",
+  playerClass == "NS" ~ "NS",
+  playerClass == "r" ~ "R",
+  playerClass == "so" ~ "SO",
+  playerClass == "So" ~ "SO",
+  playerClass == "SO" ~ "SO",
+  playerClass == "sr" ~ "SR",
+  playerClass == "Sr" ~ "SR",
+  playerClass == "SR" ~ "SR",
+  playerClass == "Uk" ~ "UK",
+  playerClass == "Uk" ~ "UK"
+))
+College_Pitching_Combined <- College_Pitching_Combined %>% mutate(Class = case_when(
+  playerClass == "5S" ~ "5S",
+  playerClass == "HS" ~ "HS",
+  playerClass == "J4" ~ "J4",
+  playerClass == "jr" ~ "JR",
+  playerClass == "Jr" ~ "JR",
+  playerClass == "NS" ~ "NS",
+  playerClass == "r" ~ "R",
+  playerClass == "so" ~ "SO",
+  playerClass == "So" ~ "SO",
+  playerClass == "SO" ~ "SO",
+  playerClass == "sr" ~ "SR",
+  playerClass == "Sr" ~ "SR",
+  playerClass == "SR" ~ "SR",
+  playerClass == "Uk" ~ "UK",
+  playerClass == "Uk" ~ "UK",
+  playerClass == "Fr" ~ "FR",
+  playerClass == "JR" ~ "JR"
+))
+
+
+#Look to see if it makes sense to not include any conference#
+Pitching_Summary <- College_Pitching_Combined %>% filter(draft_overall > 0 & signed == "Y") %>% dplyr::group_by(leagueName) %>% dplyr::summarise(N = n())
+View(Pitching_Summary)
+Batting_Summary <- College_Batting_Combined %>% filter(draft_overall > 0 & signed == "Y") %>% dplyr::group_by(leagueName) %>% dplyr::summarise(N = n())
+View(Batting_Summary)
+
+#Look at correlations between salary and stats (did this after making Top 10 Bats and Arms below)
+#Anything with a dot "." for batters means it's a percentage. Anything with CA means it was multiplied by a conference adjusted weight and anything with a z means that it was given a z score in prior work relative to the year and conference. A CAZ means conference weight multiplied by the Z score. I've tried a lot of approaches here to see how to best account for conference.
+Batter_Cors <- cor(Top_10_Bats %>% select(bonus, Bavg:OPS, Age, X1B.:wOBA, SB.:CAwOBA, wRC.:CAwRC., Z_Single:CAZ_wRC))
+View(Batter_Cors)
+Pitcher_Cors <- cor(Top_10_Arms %>% select(bonus, ERA:Age, Height:CAFIP, Z_K:CAZ_FIP))
+View(Pitcher_Cors)
+
+
+
+
+
+################################
+##### BEGIN TO MODEL BONUS #####
+################################
+
+### BAYESIAN APPROACH ###
+
+#Batters model and train/test split
+Top_10_Bats <- College_Batting_Combined %>% filter(draftRound <= 10 & signed == "Y")
+indexes <- sample(1:nrow(Top_10_Bats), size = 0.25*nrow(Top_10_Bats)) 
+test_Batters <- Top_10_Bats[indexes,]
+train_Batters <- Top_10_Bats[-indexes,] 
+
+bats.lm <- stan_glm(log(bonus) ~ wRC. + HR. + BB. + K. + XBH. + SB. + as.factor(Class) + leagueName_Rating, data = train_Batters)
+
+pp_check(bats.lm)
+pp_check(bats.lm, plotfun = "scatter")
+
+#Pitchers model and train/test split
+Top_10_Arms <- College_Pitching_Combined %>% filter(draftRound <= 10 & signed == "Y" & Class != "HS")
+indexes <- sample(1:nrow(Top_10_Arms), size = 0.25*nrow(Top_10_Arms)) 
+test_Pitchers <- Top_10_Arms[indexes,]
+train_Pitchers <- Top_10_Arms[-indexes,] 
+
+pitchers.lm <- stan_glm(log(bonus) ~ `GS%` + `K%` + `BB%` + `HR%` + Height + as.factor(Class) + leagueName_Rating, data = train_Pitchers)
+
+pp_check(pitchers.lm)
+pp_check(pitchers.lm, plotfun = "scatter")
+
+sqrt(mean(bats.lm$residuals^2))
+bats.lm$coefficients
+sqrt(mean(pitchers.lm$residuals^2))
+pitchers.lm$coefficients
+
+#Produce the summary. For each parameter mcse is Monte Carlo standard error. N_eff is a crude measure of sample size and Rhat (measure of within chain variance compared to across chain variance) is potential scale reduction factor on split chains. Want values less than 1.1
+summary(bats.lm)
+summary(pitchers.lm)
+
+#Print a tidy summary of the coefficients
+tidy(bats.lm)
+tidy(pitchers.lm)
+
+#90% Credible interval of parameters: Probability of value falling between two points
+posterior_interval(bats.lm, prob = 0.95)
+posterior_interval(pitchers.lm, prob = 0.95)
+
+# Save the variance of residulas and fitted values and calculate R^2
+ss_res <- var(residuals(bats.lm))
+ss_fit <- var(fitted(bats.lm))
+1 - (ss_res / (ss_res + ss_fit))
+
+ss_res <- var(residuals(pitchers.lm))
+ss_fit <- var(fitted(pitchers.lm))
+1 - (ss_res / (ss_res + ss_fit))
+
+# Calculate the posterior distribution of the R^2
+r2_posterior_batters <- bayes_R2(bats.lm)
+r2_posterior_pitchers <- bayes_R2(pitchers.lm)
+# Make a histogram of the distribution
+hist(r2_posterior_batters)
+hist(r2_posterior_pitchers)
+
+#Add predictions to data set
+batter_preds <- exp(posterior_predict(bats.lm, draws = 500))
+batter_means <- colMeans(batter_preds)
+batter_medians <- apply(batter_preds, 2, median)
+Top_10_Bats$Mean_Pred <- batter_means
+Top_10_Bats$Med_Pred <- batter_medians
+
+pitcher_preds <- exp(posterior_predict(pitchers.lm, draws = 500))
+pitcher_means <- colMeans(pitcher_preds)
+pitcher_medians <- apply(pitcher_preds, 2, median)
+Top_10_Arms$Mean_Pred <- pitcher_means
+Top_10_Arms$Med_Pred <- pitcher_medians
+
+#Light blue line is distribution of predictions from a replication and dark blue is observed data. We want to see if it fits by seeing if it aligns.
+pp_check(bats.lm, "dens_overlay")
+pp_check(pitchers.lm, "dens_overlay")
+
+#Summary of predictions and actual results to see how we compare
+summary(Top_10_Bats$Med_Pred)
+summary(Top_10_Bats$Mean_Pred)
+summary(Top_10_Bats$bonus)
+
+summary(Top_10_Arms$Med_Pred)
+summary(Top_10_Arms$Mean_Pred)
+summary(Top_10_Arms$bonus)
+
+#Density Curves for actual and predicted players
+#Divide by 1 mil to make more interpretable
+Top_10_Arms$bonus <- Top_10_Arms$bonus / 1000000
+ggplot(Top_10_Arms, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5)
+
+Top_10_Arms$Med_Pred <- Top_10_Arms$Med_Pred / 1000000
+ggplot(Top_10_Arms, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5)
+
+Top_10_Bats$bonus <- Top_10_Bats$bonus / 1000000
+ggplot(Top_10_Bats, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4)
+
+Top_10_Bats$Med_Pred <- Top_10_Bats$Med_Pred / 1000000
+ggplot(Top_10_Bats, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4)
+
+
+#Make predictions on the test set I went back and retrained model on a train/test set (not the whole model) and ran this just in case I need a train/test set with Bayesian model
+batter_preds <- exp(posterior_predict(bats.lm, test_Batters, draws = 500))
+colnames(batter_preds) <- test_Batters$lastName.x
+batter_means <- colMeans(batter_preds)
+batter_medians <- apply(batter_preds, 2, median)
+test_Batters$Mean_Pred <- batter_means
+test_Batters$Med_Pred <- batter_medians
+View(test_Batters)
+
+pitcher_preds <- exp(posterior_predict(pitchers.lm, test_Pitchers, draws = 500))
+colnames(pitcher_preds) <- test_Pitchers$lastName.x
+pitcher_means <- colMeans(pitcher_preds)
+pitcher_medians <- apply(pitcher_preds, 2, median)
+test_Pitchers$Mean_Pred <- pitcher_means
+test_Pitchers$Med_Pred <- pitcher_medians
+View(test_Pitchers)
+
+#Interested in looking at actual versus predicted
+test_Pitchers$bonus <- test_Pitchers$bonus / 1000000
+test_Pitchers$Med_Pred <- test_Pitchers$Med_Pred / 1000000
+ggplot(test_Pitchers, aes(x = bonus, y = Med_Pred, alpha = 0.75)) + geom_point(size = 0.9) + geom_smooth() + geom_jitter() + ggtitle("Salary Based on Predicted Salary") + labs(y = "Predicted Bonus ($M)", x = "Bonus ($M)") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + theme(legend.position='none') + xlim(0,1) + ylim(0, 1)
+
+test_Batters$bonus <- test_Batters$bonus / 1000000
+test_Batters$Med_Pred <- test_Batters$Med_Pred / 10000000
+ggplot(test_Batters, aes(x = bonus, y = Med_Pred, alpha = 0.75)) + geom_point(size = 0.9) + geom_smooth() + geom_jitter() + ggtitle("Salary Based on Predicted Salary") + labs(y = "Predicted Bonus ($M)", x = "Bonus ($M)") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + theme(legend.position='none') + xlim(0,1) + ylim(0,1)
+
+
+#Where the misses came (Something I could look at for future papers for train/test or with all data)
+Miss_Summary <- test_Batters %>% group_by(draft_Round) %>% dplyr::summarise(N = n(), Pred = mean(Med_Pred), Bonus = mean(bonus), Miss = median(Bonus_Miss), Miss2 = mean(Bonus_Miss))
+View(Miss_Summary)
+Miss_Summary <- test_Pitchers %>% group_by(draft_Round) %>% dplyr::summarise(N = n(), Pred = mean(Med_Pred), Bonus = mean(bonus), Miss = median(Bonus_Miss), Miss2 = mean(Bonus_Miss))
+View(Miss_Summary)
+
+#Look at miss stats
+caret::RMSE(test_Batters$bonus, test_Batters$Med_Pred) #839230.6, 801127.5, 1042622
+caret::MAE(test_Batters$bonus, test_Batters$Med_Pred) #356921.1, 362871, 442872.9
+cor(test_Batters$bonus, test_Batters$Med_Pred) ^ 2 #0.3719506, 0.3333525, 0.325921
+
+#Look at miss stats
+caret::RMSE(test_Pitchers$bonus, test_Pitchers$Med_Pred) #748173.5, 657326.2, 709964.8
+caret::MAE(test_Pitchers$bonus, test_Pitchers$Med_Pred) #321910.8, 314094.6, 363914.3
+cor(test_Pitchers$bonus, test_Pitchers$Med_Pred) ^ 2 #0.4020421, 0.324409, 0.3346145
+
+
+
+
+
+
+# RF For Bonus #
+#Want to compare to Bayesian
+#Batters train/test split
+indexes <- sample(1:nrow(Top_10_Bats), size = 0.25*nrow(Top_10_Bats)) 
+test_Batters <- Top_10_Bats[indexes,]
+train_Batters <- Top_10_Bats[-indexes,] 
+#Pitchers train/test split
+indexes <- sample(1:nrow(Top_10_Arms), size = 0.25*nrow(Top_10_Arms)) 
+test_Pitchers <- Top_10_Arms[indexes,]
+train_Pitchers <- Top_10_Arms[-indexes,] 
+trControl <- trainControl(method = "cv", number = 10)
+
+batters_rf <- caret::train(log(bonus) ~ CAwRC. + CAHR. + CABB. + CAK. + CAXBH. + SB. + as.factor(Class) , data = train_Batters,
+                           method = "rf",
+                           trControl = trControl,
+                           importance = TRUE, na.action=na.exclude)
+pitchers_rf <- caret::train(log(bonus) ~ `GS%` + `CAK%` + `CABB%` + `HR%` + Height + as.factor(Class), data = train_Pitchers,
+                                 method = "rf",
+                                 trControl = trControl,
+                                 importance = TRUE, na.action=na.exclude)
+
+batters_rf
+pitchers_rf
+
+varImp(batters_rf)
+varImp(pitchers_rf)
+
+#Analyze the RFs
+pred <- exp(predict(object = batters_rf, newdata = test_Batters))
+test_Batters$pred <- pred
+caret::RMSE(test_Batters$bonus, test_Batters$pred) #841620.4, 1137154, 903482.2
+caret::MAE(test_Batters$bonus, test_Batters$pred) #372310.4, 524061.5, 385453.8
+cor(test_Batters$bonus, test_Batters$pred) ^ 2 #0.2846142,  0.2631518, 0.1902379
+
+pred <- exp(predict(object = pitchers_rf, newdata = test_Pitchers))
+test_Pitchers$pred <- pred
+caret::RMSE(test_Pitchers$bonus, test_Pitchers$pred) #536789.7, 838027.7, 747639.3
+caret::MAE(test_Pitchers$bonus, test_Pitchers$pred) #283556.5, 379717.8, 326988.8
+cor(test_Pitchers$bonus, test_Pitchers$pred) ^ 2 #0.2658666, 0.4065484, 0.2614092
+
+#Predictions on the whole data set
+Top_10_Bats$RF_Pred <- exp(predict(object = batters_rf, newdata = Top_10_Bats))
+Top_10_Arms$RF_Pred <- exp(predict(object = pitchers_rf, newdata = Top_10_Arms))
+
+
+
+
+
+
+#KNN for Bonus just to compare performance
+trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+knn_batters <- train(log(bonus) ~ wRC. + HR. + BB. + K. + XBH. + SB. + as.factor(Class) + leagueName_Rating, data = train_Batters, method = "knn", trControl=trctrl, preProcess = c("center", "scale"), tuneLength = 20, na.action=na.exclude)
+print(knn_batters)
+
+train_Pitchers <- train_Pitchers %>% filter(!is.na(Class))
+knn_pitchers <- train(log(bonus) ~ `GS%` + `K%` + `BB%` + `HR%` + Height + as.factor(Class) + leagueName_Rating, data = train_Pitchers, method = "knn", trControl=trctrl, preProcess = c("center", "scale"), tuneLength = 20, na.action=na.exclude)
+print(knn_pitchers)
+
+#Analyze the KNN
+pred_p <- predict(object = knn_batters, newdata = test_Batters)
+caret::RMSE(test_Batters$bonus, pred_p) #1123107
+caret::MAE(test_Batters$bonus, pred_p) #556199.6
+cor(pred_p, test_Batters$bonus) ^ 2 #0.1715885
+
+pred_p <- predict(object = knn_pitchers, newdata = test_Pitchers)
+caret::RMSE(test_Pitchers$bonus, pred_p) #985719.2
+caret::MAE(test_Pitchers$bonus, pred_p) #489290.3
+cor(pred_p, test_Pitchers$bonus) ^ 2 #0.1814146
+
+
+#Bayesian approach does seem to give the best results
+```
+
