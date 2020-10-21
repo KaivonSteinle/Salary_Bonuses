@@ -7,13 +7,15 @@ output: html_document
 # Can we predict a player's signing bonus? #
 
 library(rstanarm)
+library(bayesplot)
 library(dplyr)
 library(ggplot2)
 library(magrittr)
+library(shinystan)
 
 #Import data
 College_Pitching <- read.csv("college_pitching_past.csv")
-College_Pitching_Recent <- read.csv("~/Desktop/steinle_college_pitching_recent.csv")
+College_Pitching_Recent <- read.csv("college_pitching_recent.csv")
 College_Pitching <- rbind(College_Pitching, College_Pitching_Recent)
 College_Pitching <- College_Pitching %>% filter(year >= 2014)
 View(College_Pitching)
@@ -61,7 +63,7 @@ names(College_Pitching)[1] <- "PlayerID"
 College_Pitching_Combined <- merge(College_Pitching, Bonus, by = c("PlayerID", "year", "draft_overall"))
 View(College_Pitching_Combined)
 
-
+#Creating different class categories
 College_Batting_Combined <- College_Batting_Combined %>% mutate(Class = case_when(
   playerClass == "5S" ~ "5S",
   playerClass == "HS" ~ "HS",
@@ -79,6 +81,24 @@ College_Batting_Combined <- College_Batting_Combined %>% mutate(Class = case_whe
   playerClass == "SR" ~ "SR",
   playerClass == "Uk" ~ "UK",
   playerClass == "Uk" ~ "UK"
+))
+College_Batting_Combined <- College_Batting_Combined %>% mutate(Class2 = case_when(
+  playerClass == "5S" ~ "NS",
+  playerClass == "HS" ~ "NS",
+  playerClass == "J4" ~ "NS",
+  playerClass == "jr" ~ "NS",
+  playerClass == "Jr" ~ "NS",
+  playerClass == "JR" ~ "NS",
+  playerClass == "NS" ~ "NS",
+  playerClass == "r" ~ "NS",
+  playerClass == "so" ~ "NS",
+  playerClass == "So" ~ "NS",
+  playerClass == "SO" ~ "NS",
+  playerClass == "sr" ~ "SR",
+  playerClass == "Sr" ~ "SR",
+  playerClass == "SR" ~ "SR",
+  playerClass == "Uk" ~ "NS",
+  playerClass == "Uk" ~ "NS"
 ))
 College_Pitching_Combined <- College_Pitching_Combined %>% mutate(Class = case_when(
   playerClass == "5S" ~ "5S",
@@ -99,6 +119,49 @@ College_Pitching_Combined <- College_Pitching_Combined %>% mutate(Class = case_w
   playerClass == "Fr" ~ "FR",
   playerClass == "JR" ~ "JR"
 ))
+College_Pitching_Combined <- College_Pitching_Combined %>% mutate(Class2 = case_when(
+  playerClass == "5S" ~ "NS",
+  playerClass == "HS" ~ "NS",
+  playerClass == "J4" ~ "NS",
+  playerClass == "jr" ~ "NS",
+  playerClass == "Jr" ~ "NS",
+  playerClass == "JR" ~ "NS",
+  playerClass == "NS" ~ "NS",
+  playerClass == "r" ~ "NS",
+  playerClass == "so" ~ "NS",
+  playerClass == "So" ~ "NS",
+  playerClass == "SO" ~ "NS",
+  playerClass == "sr" ~ "SR",
+  playerClass == "Sr" ~ "SR",
+  playerClass == "SR" ~ "SR",
+  playerClass == "Uk" ~ "NS",
+  playerClass == "Uk" ~ "NS"
+))
+
+#Make a column of the percent of bonus pool
+College_Batting_Combined <- College_Batting_Combined %>% mutate(Pool = case_when(
+  year == 2019 ~ 266480400,
+  year == 2018 ~ 255969600,
+  year == 2017 ~ 245806800,
+  year == 2016 ~ 234331200,
+  year == 2015 ~ 223834500,
+  year == 2014 ~ 205786400
+))
+College_Pitching_Combined <- College_Pitching_Combined %>% mutate(Pool = case_when(
+  year == 2019 ~ 266480400,
+  year == 2018 ~ 255969600,
+  year == 2017 ~ 245806800,
+  year == 2016 ~ 234331200,
+  year == 2015 ~ 223834500,
+  year == 2014 ~ 205786400
+))
+College_Batting_Combined$Percent_Bonus <- College_Batting_Combined$bonus / College_Batting_Combined$Pool
+College_Pitching_Combined$Percent_Bonus <- College_Pitching_Combined$bonus / College_Pitching_Combined$Pool
+
+#Bring in strength of schedule:
+SOS <- read_excel("SOS.xlsx")
+College_Batting_Combined <- merge(College_Batting_Combined, SOS, by = c("year", "Team"))
+College_Pitching_Combined <- merge(College_Pitching_Combined, SOS, by = c("year", "Team"))
 
 
 #Look to see if it makes sense to not include any conference#
@@ -109,11 +172,10 @@ View(Batting_Summary)
 
 #Look at correlations between salary and stats (did this after making Top 10 Bats and Arms below)
 #Anything with a dot "." for batters means it's a percentage. Anything with CA means it was multiplied by a conference adjusted weight and anything with a z means that it was given a z score in prior work relative to the year and conference. A CAZ means conference weight multiplied by the Z score. I've tried a lot of approaches here to see how to best account for conference.
-Batter_Cors <- cor(Top_10_Bats %>% select(bonus, Bavg:OPS, Age, X1B.:wOBA, SB.:CAwOBA, wRC.:CAwRC., Z_Single:CAZ_wRC))
+Batter_Cors <- cor(Top_10_Bats %>% select(bonus, Bavg:OPS, Age, X1B.:wOBA, SB.:CAwOBA, wRC.:CAwRC., Z_Single:CAZ_wRC, leagueName_Rating, Rank))
 View(Batter_Cors)
-Pitcher_Cors <- cor(Top_10_Arms %>% select(bonus, ERA:Age, Height:CAFIP, Z_K:CAZ_FIP))
+Pitcher_Cors <- cor(Top_10_Arms %>% select(bonus, ERA:Age, Height:CAFIP, Z_K:CAZ_FIP, leagueName_Rating, Rank))
 View(Pitcher_Cors)
-
 
 
 
@@ -125,33 +187,87 @@ View(Pitcher_Cors)
 ### BAYESIAN APPROACH ###
 
 #Batters model and train/test split
-Top_10_Bats <- College_Batting_Combined %>% filter(draftRound <= 10 & signed == "Y")
+Top_10_Bats <- College_Batting_Combined %>% filter(draftRound <= 10 & signed == "Y" & bonus > 0)
+#Added in position categories not used for now
+Top_10_Bats <- Top_10_Bats %>% mutate(Position = case_when(
+  draftPosit == "SS"  ~ 'SS',
+  draftPosit == "2B"  ~ '2B',
+  draftPosit == "3b"  ~ '3B',
+  draftPosit == "3B"  ~ '3B',
+  draftPosit == "1b"  ~ '1B',
+  draftPosit == "1B"  ~ '1B',
+  draftPosit == "IF"  ~ 'IF',
+  draftPosit == "P"  ~ 'P',
+  draftPosit == "LF"  ~ 'OF',
+  draftPosit == "RF"  ~ 'OF',
+  draftPosit == "CF"  ~ 'CF',
+  draftPosit == "OF"  ~ 'OF',
+  draftPosit == "C"  ~ 'C'
+))
+Mathias <- Top_10_Bats %>% filter(draftPosit == 'IF')
+Mathias$Position <- '2B'
+Top_10_Bats <- Top_10_Bats %>% filter(draftPosit != 'IF')
+rbind(Top_10_Bats, Mathias)
+Top_10_Bats$Position <- as.factor(Top_10_Bats$Position)
+Top_10_Bats <- Top_10_Bats %>% mutate(Position2 = case_when(
+  draftPosit == "SS"  ~ 'MIF',
+  draftPosit == "2B"  ~ 'MIF',
+  draftPosit == "3b"  ~ 'CIF',
+  draftPosit == "3B"  ~ 'CIF',
+  draftPosit == "1b"  ~ 'CIF',
+  draftPosit == "1B"  ~ 'CIF',
+  draftPosit == "IF"  ~ 'MIF',
+  draftPosit == "P"  ~ 'P',
+  draftPosit == "LF"  ~ 'OF',
+  draftPosit == "RF"  ~ 'OF',
+  draftPosit == "CF"  ~ 'CF',
+  draftPosit == "OF"  ~ 'OF',
+  draftPosit == "C"  ~ 'C'
+))
+Top_10_Bats <- Top_10_Bats %>% mutate(Position3 = case_when(
+  draftPosit == "SS"  ~ 'Premium',
+  draftPosit == "2B"  ~ 'NP',
+  draftPosit == "3b"  ~ 'NP',
+  draftPosit == "3B"  ~ 'NP',
+  draftPosit == "1b"  ~ 'NP',
+  draftPosit == "1B"  ~ 'NP',
+  draftPosit == "IF"  ~ 'NP',
+  draftPosit == "P"  ~ 'P',
+  draftPosit == "LF"  ~ 'NP',
+  draftPosit == "RF"  ~ 'NP',
+  draftPosit == "CF"  ~ 'Premium',
+  draftPosit == "OF"  ~ 'NP',
+  draftPosit == "C"  ~ 'Premium'
+))
+
+#Train/test and can model
 indexes <- sample(1:nrow(Top_10_Bats), size = 0.25*nrow(Top_10_Bats)) 
 test_Batters <- Top_10_Bats[indexes,]
 train_Batters <- Top_10_Bats[-indexes,] 
 
-bats.lm <- stan_glm(log(bonus) ~ wRC. + HR. + BB. + K. + XBH. + SB. + as.factor(Class) + leagueName_Rating, data = train_Batters)
+bats.lm <- stan_glm(log(bonus) ~ wRC. + HR. + BB. + SB. + as.factor(Class2) + leagueName_Rating, data = Top_10_Bats, adapt_delta = 0.91, iter = 2500)
 
-pp_check(bats.lm)
-pp_check(bats.lm, plotfun = "scatter")
 
 #Pitchers model and train/test split
-Top_10_Arms <- College_Pitching_Combined %>% filter(draftRound <= 10 & signed == "Y" & Class != "HS")
+Top_10_Arms <- College_Pitching_Combined %>% filter(draftRound <= 10 & signed == "Y" & !is.na(Class2) & !is.na(leagueName_Rating) & !is.na(Height) & !is.na(`K%`) & !is.na(`BB%`) & !is.na(FIP) & !is.na(`GS%`) & !is.na(bonus) & bonus > 0)
 indexes <- sample(1:nrow(Top_10_Arms), size = 0.25*nrow(Top_10_Arms)) 
 test_Pitchers <- Top_10_Arms[indexes,]
 train_Pitchers <- Top_10_Arms[-indexes,] 
+Top_10_Arms$Class2 <- as.factor(Top_10_Arms$Class2)
 
-pitchers.lm <- stan_glm(log(bonus) ~ `GS%` + `K%` + `BB%` + `HR%` + Height + as.factor(Class) + leagueName_Rating, data = train_Pitchers)
+pitchers.lm <- stan_glm(log(bonus) ~ `GS%` + `K%` + `BB%` + Height + as.factor(Class2) + leagueName_Rating, data = Top_10_Arms, adapt_delta = 0.91, iter = 2500)
 
-pp_check(pitchers.lm)
-pp_check(pitchers.lm, plotfun = "scatter")
 
 sqrt(mean(bats.lm$residuals^2))
 bats.lm$coefficients
 sqrt(mean(pitchers.lm$residuals^2))
 pitchers.lm$coefficients
 
-#Produce the summary. For each parameter mcse is Monte Carlo standard error. N_eff is a crude measure of sample size and Rhat (measure of within chain variance compared to across chain variance) is potential scale reduction factor on split chains. Want values less than 1.1
+#The different colors indicate different chains, each of which started at a randomly selected initial value.
+plot(bats.lm, "trace")
+plot(pitchers.lm, "trace")
+
+#Looking at R Hat and n_eff
 summary(bats.lm)
 summary(pitchers.lm)
 
@@ -162,6 +278,17 @@ tidy(pitchers.lm)
 #90% Credible interval of parameters: Probability of value falling between two points
 posterior_interval(bats.lm, prob = 0.95)
 posterior_interval(pitchers.lm, prob = 0.95)
+
+#Light blue line is distribution of predictions from a replication and dark blue is observed data. We want to see if it fits by seeing if it aligns.
+pp_check(bats.lm, "dens_overlay")
+pp_check(pitchers.lm, "dens_overlay")
+
+pp_check(bats.lm, plotfun = "scatter")
+pp_check(pitchers.lm, plotfun = "scatter")
+
+#Shiny stan to get formatted table of all coefficients
+launch_shinystan(bats.lm)
+launch_shinystan(pitchers.lm)
 
 # Save the variance of residulas and fitted values and calculate R^2
 ss_res <- var(residuals(bats.lm))
@@ -179,6 +306,7 @@ r2_posterior_pitchers <- bayes_R2(pitchers.lm)
 hist(r2_posterior_batters)
 hist(r2_posterior_pitchers)
 
+#Posterior predictive checking is the process of simulating data according to the fitted model and comparing the simulations to the observed data to look for important discrepancies. If the model fits the data well we should be able to replicate important features of the observed data in the simulations. To generate these simulations, we need to sample from the posterior predictive distribution, which is the distribution of the outcome variable implied by the posterior distribution of the model parameters. Each time the MCMC draws from the posterior distribution, we generate a new dataset according to the data generating process used in our model
 #Add predictions to data set
 batter_preds <- exp(posterior_predict(bats.lm, draws = 500))
 batter_means <- colMeans(batter_preds)
@@ -192,9 +320,6 @@ pitcher_medians <- apply(pitcher_preds, 2, median)
 Top_10_Arms$Mean_Pred <- pitcher_means
 Top_10_Arms$Med_Pred <- pitcher_medians
 
-#Light blue line is distribution of predictions from a replication and dark blue is observed data. We want to see if it fits by seeing if it aligns.
-pp_check(bats.lm, "dens_overlay")
-pp_check(pitchers.lm, "dens_overlay")
 
 #Summary of predictions and actual results to see how we compare
 summary(Top_10_Bats$Med_Pred)
@@ -205,19 +330,20 @@ summary(Top_10_Arms$Med_Pred)
 summary(Top_10_Arms$Mean_Pred)
 summary(Top_10_Arms$bonus)
 
-#Density Curves for actual and predicted players
+#Density Curves for actual and median of predicted players
 #Divide by 1 mil to make more interpretable
 Top_10_Arms$bonus <- Top_10_Arms$bonus / 1000000
-ggplot(Top_10_Arms, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5)
+ggplot(Top_10_Arms, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5) + ylim(0, 1300)
 
 Top_10_Arms$Med_Pred <- Top_10_Arms$Med_Pred / 1000000
-ggplot(Top_10_Arms, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5)
+ggplot(Top_10_Arms, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Pitchers") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 3.5) + ylim(0, 1300)
 
 Top_10_Bats$bonus <- Top_10_Bats$bonus / 1000000
-ggplot(Top_10_Bats, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4)
+ggplot(Top_10_Bats, aes(x = bonus)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4) + ylim(0, 950)
 
 Top_10_Bats$Med_Pred <- Top_10_Bats$Med_Pred / 1000000
-ggplot(Top_10_Bats, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4)
+ggplot(Top_10_Bats, aes(x = Med_Pred)) + geom_density(aes(y = ..count..), fill = "#A0A0A0A0") + labs(x = "Signing Bonus $M", y = "Count") + ggtitle("Predicted Bonus Distribution For Batters") + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.title = element_text(face = "bold", size = 14)) + theme(axis.title.x = element_text(face = "bold")) + theme(axis.title.y = element_text(face = "bold")) + theme(legend.title = element_text(face = "bold")) + xlim(0, 4) + ylim(0, 950)
+
 
 
 #Make predictions on the test set I went back and retrained model on a train/test set (not the whole model) and ran this just in case I need a train/test set with Bayesian model
@@ -336,8 +462,5 @@ pred_p <- predict(object = knn_pitchers, newdata = test_Pitchers)
 caret::RMSE(test_Pitchers$bonus, pred_p) #985719.2
 caret::MAE(test_Pitchers$bonus, pred_p) #489290.3
 cor(pred_p, test_Pitchers$bonus) ^ 2 #0.1814146
-
-
-#Bayesian approach does seem to give the best results
 ```
 
